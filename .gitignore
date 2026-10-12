@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Data (personal photos & generated output)
+input_images/
+output_avatars/
+headshots to convert/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
