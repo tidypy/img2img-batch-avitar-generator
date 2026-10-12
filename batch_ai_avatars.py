@@ -342,6 +342,15 @@ def process_batch(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     images = list(iter_input_images(input_dir))
+    index = next_output_index(output_dir)
+    existing_count = index - 1
+    if args.resume and existing_count > 0:
+        if existing_count >= len(images):
+            log.info("All %d images have already been processed into %s.", len(images), output_dir)
+            return 0
+        log.info("Resuming batch: skipping %d already-generated image(s).", existing_count)
+        images = images[existing_count:]
+
     if args.limit is not None and args.limit > 0:
         images = images[:args.limit]
     if not images:
@@ -357,7 +366,6 @@ def process_batch(args: argparse.Namespace) -> int:
     })
     public = requests.Session()
 
-    index = next_output_index(output_dir)
     succeeded = failed = 0
     log.info("Processing %d image(s) via %s", len(images), GENERATE_URL)
 
@@ -440,6 +448,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Base delay (seconds) for exponential backoff.")
     parser.add_argument("--delay", type=float, default=env_float("REQUEST_DELAY", 1.0),
                         help="Pause (seconds) between images to avoid rate limits.")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="Skip input images that already have corresponding sequential output avatars.")
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit processing to the first N images.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging.")
