@@ -1,6 +1,6 @@
 # Img2Img Batch Avatar Generator
 
-Turn a folder of ordinary photos into stylized, pop-art cartoon avatars in one command. This pipeline is **powered by [Nano Banana](https://nanobnana.com)'s image generation API**. It sends each photo to the `nano2` image-editing model with a curated style prompt and saves the results automatically, recreating the "Lensa AI" magic-avatar effect with open-source code.
+Turn a folder of ordinary photos into stylized, pop-art cartoon avatars in one command. This pipeline is **powered by the [NanoBanana API](https://docs.nanobananaapi.ai)** (`nanobananaapi.ai`). It sends each photo to the image-to-image endpoint with a curated style prompt, polls task status asynchronously, and saves the results automatically.
 
 > 📖 **[Read the Full Tutorial →](https://christopherlazok.com/blog/recreating-lensa-ai-stable-diffusion)**
 
@@ -8,32 +8,34 @@ Turn a folder of ordinary photos into stylized, pop-art cartoon avatars in one c
 
 ## Features
 
-- **Powered by Nano Banana**: uses the [Image-to-Image API](https://nanobnana.com/docs/api/image-to-image) with the `nano2` model (`nano` and `nano2pro` also supported).
-- **Batch processing**: drop any number of photos into `input_images/` and run once.
-- **Async task polling**: submits each job to `POST /api/edit`, then polls `GET /api/status` until the image is ready.
-- **Curated style prompt**: *"highly detailed flat vector art illustration, pop art style, professional cartoon illustration, masterpiece, clean lines, solid background."*
-- **Sequential output naming**: `avatar_0001.png`, `avatar_0002.png`, and so on. Existing results are never overwritten.
-- **Robust error handling**: skips non-image and corrupt files, retries rate limits (HTTP 429) and server errors with exponential backoff, and stops early on bad API keys or insufficient credits.
-- **Automatic preprocessing**: fixes EXIF rotation, converts to RGB, and downsizes large photos.
+- **Powered by NanoBanana API**: uses the official image generation endpoints:
+  - Task Creation: `POST https://api.nanobananaapi.ai/api/v1/nanobanana/generate`
+  - Task Status Query: `GET https://api.nanobananaapi.ai/api/v1/nanobanana/record-info`
+- **Batch Processing**: drop any number of photos into an input folder and process them sequentially with automatic progress reporting.
+- **Image-to-Image Mode**: passes `"type": "IMAGETOIAMGE"` along with public reference image URLs in `"imageUrls": [...]`.
+- **Litterbox Upload Bridge**: automatically resizes and uploads local headshots to [Litterbox](https://litterbox.catbox.moe) (temporary 1-hour hosting) so the API receives reachable public URLs.
+- **Curated Style Prompt**: *"highly detailed flat vector art illustration, pop art style, professional cartoon illustration, masterpiece, clean lines, solid background"*
+- **Sequential Output Naming**: `avatar_0001.png`, `avatar_0002.png`, and so on. Existing outputs are detected to prevent overwriting.
+- **Robust Error Handling & Backoff**: skips non-image files, handles rate limiting with exponential backoff, and halts early on authentication errors.
 
 ## How It Works
 
 ```mermaid
 flowchart LR
-    A["input_images/"] --> B["Normalize with Pillow"]
-    B --> C["Temporary public URL"]
-    C --> D["POST /api/edit (nano2)"]
-    D --> E["Poll GET /api/status"]
-    E --> F["Download result"]
+    A["input folder (e.g. headshots_to_convert/)"] --> B["Validate & Preprocess with Pillow"]
+    B --> C["Upload to Litterbox (temp URL)"]
+    C --> D["POST /api/v1/nanobanana/generate"]
+    D --> E["Poll GET /api/v1/nanobanana/record-info"]
+    E --> F["Download resultImageUrl"]
     F --> G["output_avatars/avatar_0001.png"]
 ```
 
-> **Why a temporary upload?** The Nano Banana API only accepts **publicly accessible image URLs**. By default, each local photo is uploaded to [Litterbox](https://litterbox.catbox.moe), an anonymous host that deletes files automatically after 1 hour. If your images are already hosted (for example, in an S3 bucket or on a CDN), set `PUBLIC_IMAGE_BASE_URL` and the upload step is skipped. Your API key is only ever sent to `nanobnana.com`.
+> **Why a temporary upload bridge?** The NanoBanana API requires image URLs in `imageUrls` to be publicly accessible. By default, local headshots are safely converted to RGB, normalized, and uploaded to Litterbox (auto-deleted after 1 hour). If your images are already hosted (e.g., S3 or CDN), you can specify `--public-base-url` to skip temporary uploads. Your API key is only sent directly to `api.nanobananaapi.ai`.
 
 ## Prerequisites
 
 - **Python 3.9+**
-- A **Nano Banana API key** with available credits: [nanobnana.com](https://nanobnana.com)
+- A **NanoBanana API key**: [nanobananaapi.ai](https://nanobananaapi.ai)
 
 ## Installation
 
@@ -54,43 +56,45 @@ pip install -r requirements.txt
 
 # 4. Configure your API key
 cp .env.example .env        # Windows: copy .env.example .env
-# then edit .env and set NANO_BANANA_API_KEY=...
+# then edit .env and set NANO_BANANA_API_KEY=your_api_key_here
 ```
 
 ## Usage
 
-1. Place your source photos (`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tiff`) in `input_images/`.
-2. Run the script:
+Place your source photos (`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tiff`) in your input directory, then run:
 
-   ```bash
-   python batch_ai_avatars.py
-   ```
+```bash
+# Process a folder of headshots
+python batch_ai_avatars.py -i "headshots_to_convert"
+```
 
-3. Find your avatars in `output_avatars/`.
+For verbose execution logs:
+```bash
+python batch_ai_avatars.py -i "headshots_to_convert" -v
+```
 
-### Common options
+To run a single-image verification test before the full batch:
+```bash
+python batch_ai_avatars.py -i "headshots_to_convert" --limit 1 -v
+```
+
+Generated avatars will be saved sequentially into `output_avatars/` (`avatar_0001.png`, `avatar_0002.png`, etc.).
+
+### Common Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-i, --input` | `input_images` | Source image folder |
 | `-o, --output` | `output_avatars` | Destination folder |
-| `--model` | `nano2` | `nano`, `nano2`, or `nano2pro` |
-| `--prompt` | pop-art style prompt | Styling prompt |
-| `--aspect-ratio` | `1:1` | Output aspect ratio |
-| `--resolution` | `1K` | `1K`, `2K`, or `4K` |
-| `--public-base-url` | *(none)* | Base URL of already-hosted inputs (skips upload) |
-| `--poll-interval` | `3` | Seconds between status checks |
-| `--poll-timeout` | `300` | Max seconds to wait per image |
-| `--delay` | `1.0` | Seconds to wait between images |
-| `-v, --verbose` | off | Debug logging (shows task IDs and URLs) |
-
-Example: generate higher-resolution avatars with the Pro model:
-
-```bash
-python batch_ai_avatars.py --model nano2pro --resolution 2K
-```
-
-Run `python batch_ai_avatars.py --help` for the complete list.
+| `--prompt` | vector pop-art prompt | Styling prompt |
+| `--image-size` | `1:1` | Aspect ratio (`1:1`, `9:16`, `16:9`, `3:4`, `4:3`, `3:2`, `2:3`, `5:4`, `4:5`, `21:9`) |
+| `--num-images` | `1` | Number of images to generate per input (`1`–`4`) |
+| `--limit` | *(none)* | Limit processing to the first N images |
+| `--public-base-url` | *(none)* | Base URL for already-hosted images (skips Litterbox upload) |
+| `--poll-interval` | `3.0` | Seconds between task status polling requests |
+| `--poll-timeout` | `300.0` | Maximum seconds to poll before timing out |
+| `--delay` | `1.0` | Throttling pause (seconds) between tasks |
+| `-v, --verbose` | off | Enable detailed debug logging |
 
 ## Before/After Examples
 
@@ -111,10 +115,6 @@ Want to understand how this works under the hood, and how it recreates the Lensa
 
 ## Privacy & Security
 
-- `.env`, `input_images/`, and `output_avatars/` are git-ignored, so your API key and personal photos are never committed.
-- Photos are sent to a third-party temporary host and to Nano Banana for processing. Avoid sensitive images, or use `PUBLIC_IMAGE_BASE_URL` with storage you control.
-- Never put a real API key in `.env.example` or any committed file.
-
-## Contributing
-
-Issues and pull requests are welcome! Please open an issue to discuss significant changes first.
+- `.env`, input directories, and `output_avatars/` are strictly ignored by Git to keep your API key and private headshots safe.
+- Photos uploaded via the Litterbox bridge are temporary and expire automatically.
+- Never commit active API keys to version control.

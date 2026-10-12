@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-Img2Img Batch Avatar Generator (powered by Nano Banana)
-=======================================================
+Img2Img Batch Avatar Generator (powered by NanoBanana API)
+==========================================================
 
-Loops through every image in an input directory, sends it to the Nano Banana
-image-editing API (model: ``nano2``) together with a style prompt, polls the
-task until it finishes, and saves the result to an output directory using
-sequential file names (avatar_0001.png, avatar_0002.png, ...).
+Loops through every image in an input directory, sends it to the NanoBanana
+image-editing API together with a style prompt, polls the task until it
+finishes, and saves the result to an output directory using sequential file
+names (avatar_0001.png, avatar_0002.png, ...).
 
 Workflow per image:
     1. Validate/normalize the local image with Pillow.
-    2. Upload it to a temporary public host (the Nano Banana API only accepts
-       publicly accessible image URLs).
-    3. POST  https://nanobnana.com/api/edit    -> task_id
-    4. GET   https://nanobnana.com/api/status  -> poll until status_code 1/2
-    5. Download the generated image and save it to output_avatars/.
+    2. Upload it to a temporary public host (the API only accepts publicly
+       accessible image URLs).
+    3. POST https://api.nanobananaapi.ai/api/v1/nanobanana/generate  -> data.taskId
+    4. GET  https://api.nanobananaapi.ai/api/v1/nanobanana/record-info?taskId=...
+       until successFlag is 1 (success) or 2/3 (failure).
+    5. Download data.response.resultImageUrl and save it to output_avatars/.
 
-API docs:  https://nanobnana.com/docs/api/image-to-image
+API docs:  https://docs.nanobananaapi.ai/nanobanana-api/generate-or-edit-image
 Tutorial:  https://christopherlazok.com/blog/recreating-lensa-ai-stable-diffusion
 """
 
@@ -44,18 +45,26 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 # --------------------------------------------------------------------------- #
 load_dotenv()
 
-API_BASE = os.getenv("NANO_BANANA_API_BASE", "https://nanobnana.com").rstrip("/")
-EDIT_URL = f"{API_BASE}/api/edit"
-STATUS_URL = f"{API_BASE}/api/status"
-DEFAULT_MODEL = "nano2"
+API_BASE = os.getenv("NANO_BANANA_API_BASE", "https://api.nanobananaapi.ai").rstrip("/")
+GENERATE_URL = f"{API_BASE}/api/v1/nanobanana/generate"
+STATUS_URL = f"{API_BASE}/api/v1/nanobanana/record-info"
+
+# NOTE: "IAMGE" is the API's own spelling — do not "fix" it.
+TASK_TYPE_IMAGE_TO_IMAGE = "IMAGETOIAMGE"
 
 STYLE_PROMPT = (
     "highly detailed flat vector art illustration, pop art style, "
-    "professional cartoon illustration, masterpiece, clean lines, solid background."
+    "professional cartoon illustration, masterpiece, clean lines, solid background"
 )
 
-# Status codes documented at https://nanobnana.com/docs/api/query-tasks-result
-STATUS_SUCCESS, STATUS_FAILED, STATUS_IN_PROGRESS = 1, 2, 3
+# The API requires a callback URL; we poll instead, so a placeholder is fine.
+DEFAULT_CALLBACK_URL = "https://example.com/callback"
+
+# successFlag values documented at
+# https://docs.nanobananaapi.ai/nanobanana-api/get-task-details
+FLAG_GENERATING, FLAG_SUCCESS, FLAG_CREATE_FAILED, FLAG_GENERATE_FAILED = 0, 1, 2, 3
+
+ASPECT_RATIOS = ["1:1", "9:16", "16:9", "3:4", "4:3", "3:2", "2:3", "5:4", "4:5", "21:9"]
 
 # Temporary public host used to give the API a reachable URL for local files.
 LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
@@ -63,7 +72,6 @@ LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 OUTPUT_PREFIX = "avatar_"
 OUTPUT_PATTERN = re.compile(rf"^{OUTPUT_PREFIX}(\d+)\.png$", re.IGNORECASE)
-IMAGE_URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 
 HTTP_TIMEOUT = 60
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -179,17 +187,19 @@ def parse_json(resp: requests.Response) -> dict:
 
 
 def raise_for_api_error(resp: requests.Response, payload: dict) -> None:
-    """Translate HTTP / body-level error codes into exceptions."""
-    code = payload.get("code", resp.status_code)
-    message = payload.get("message") or resp.reason
+    """
+    Translate HTTP / body-level error codes into exceptions. The API reports
+    errors in the JSON body as {"code": <int>, "msg": "..."}.
+    """
+    message = payload.get("msg") or payload.get("message") or resp.reason
     try:
-        code = int(code)
+        code = int(payload.get("code", resp.status_code))
     except (TypeError, ValueError):
         code = resp.status_code
 
-    if resp.status_code == 401 or code == 401:
+    if 401 in (resp.status_code, code):
         raise FatalAPIError(f"Unauthorized: check NANO_BANANA_API_KEY ({message})")
-    if resp.status_code == 402 or code == 402:
+    if 402 in (resp.status_code, code) or "credit" in str(message).lower():
         raise FatalAPIError(f"Insufficient credits ({message})")
     if resp.status_code >= 400 or code >= 400:
         raise RuntimeError(f"API error {code}: {message}")
@@ -201,7 +211,7 @@ def raise_for_api_error(resp: requests.Response, payload: dict) -> None:
 def upload_image(session: requests.Session, data: bytes, filename: str, args: argparse.Namespace) -> str:
     """Return a publicly accessible URL for the given image."""
     if args.public_base_url:
-        # Images are already hosted (e.g. S3 bucket / CDN mirroring input_images/).
+        # Images are already hosted (e.g. S3 bucket / CDN mirroring the input folder).
         return f"{args.public_base_url.rstrip('/')}/{quote(filename)}"
 
     resp = request_with_retries(
@@ -217,81 +227,93 @@ def upload_image(session: requests.Session, data: bytes, filename: str, args: ar
     return url
 
 
-def submit_edit_task(session: requests.Session, image_url: str, args: argparse.Namespace) -> str:
+def submit_task(session: requests.Session, image_url: str, args: argparse.Namespace) -> str:
+    """POST an image-to-image task and return its taskId."""
     body: dict[str, Any] = {
         "prompt": args.prompt,
-        "images": [image_url],
-        "model": args.model,
-        "aspect_ratio": args.aspect_ratio,
-        "resolution": args.resolution,
-        "output_format": "png",
+        "type": TASK_TYPE_IMAGE_TO_IMAGE,
+        "imageUrls": [image_url],
+        "numImages": args.num_images,
+        "image_size": args.image_size,
+        "callBackUrl": args.callback_url,
     }
+    log.debug("  POST %s payload: %s", GENERATE_URL, json.dumps(body))
     resp = request_with_retries(
-        session, "POST", EDIT_URL,
+        session, "POST", GENERATE_URL,
         max_retries=args.max_retries, base_delay=args.retry_delay, json=body,
     )
     payload = parse_json(resp)
+    log.debug("  Generate response: %s", json.dumps(payload)[:500])
     raise_for_api_error(resp, payload)
 
-    task_id = payload.get("task_id") or (payload.get("data") or {}).get("task_id")
+    data = payload.get("data") or {}
+    task_id = data.get("taskId") or data.get("task_id") or payload.get("taskId")
     if not task_id:
-        raise RuntimeError(f"No task_id in response: {json.dumps(payload)[:300]}")
-    return task_id
+        raise RuntimeError(f"No taskId in response: {json.dumps(payload)[:300]}")
+    return str(task_id)
 
 
-def poll_task(session: requests.Session, task_id: str, args: argparse.Namespace) -> Any:
-    """Poll /api/status until the task succeeds, fails, or times out."""
+def poll_task(session: requests.Session, task_id: str, args: argparse.Namespace) -> dict:
+    """Poll record-info until the task succeeds, fails, or times out. Returns `data`."""
     deadline = time.monotonic() + args.poll_timeout
     while True:
         resp = request_with_retries(
             session, "GET", STATUS_URL,
             max_retries=args.max_retries, base_delay=args.retry_delay,
-            params={"task_id": task_id},
+            params={"taskId": task_id},
         )
         payload = parse_json(resp)
         raise_for_api_error(resp, payload)
-        task = payload.get("data") or payload
+        data = payload.get("data") or {}
 
-        status_code = task.get("status_code")
-        status_text = str(task.get("status_text") or task.get("status") or "").upper()
+        try:
+            flag = int(data.get("successFlag", FLAG_GENERATING))
+        except (TypeError, ValueError):
+            flag = FLAG_GENERATING
 
-        if status_code == STATUS_SUCCESS or status_text in {"SUCCESS", "COMPLETED", "SUCCEEDED"}:
-            return task.get("response")
-        if status_code == STATUS_FAILED or status_text in {"FAILED", "FAIL", "ERROR", "NSFW"}:
-            raise TaskFailed(task.get("error_message") or task.get("message") or f"Task {task_id} failed")
+        if flag == FLAG_SUCCESS:
+            log.debug("  Task %s complete: %s", task_id, json.dumps(data)[:500])
+            return data
+        if flag in (FLAG_CREATE_FAILED, FLAG_GENERATE_FAILED):
+            stage = "create task" if flag == FLAG_CREATE_FAILED else "generate"
+            raise TaskFailed(
+                f"Failed to {stage} (errorCode={data.get('errorCode')}): "
+                f"{data.get('errorMessage') or 'no message'}"
+            )
 
         if time.monotonic() > deadline:
             raise TaskFailed(f"Timed out after {args.poll_timeout:.0f}s waiting for task {task_id}")
 
-        log.debug("  Task %s: %s", task_id, status_text or "IN_PROGRESS")
+        log.debug("  Task %s: GENERATING (successFlag=%s)", task_id, flag)
         time.sleep(args.poll_interval)
 
 
-def extract_image_urls(value: Any, depth: int = 0) -> list[str]:
-    """Recursively pull image URLs out of the task 'response' field."""
-    if value is None or depth > 6:
-        return []
-    if isinstance(value, str):
-        text = value.strip()
-        if text[:1] in "[{":
-            try:
-                return extract_image_urls(json.loads(text), depth + 1)
-            except ValueError:
-                pass
-        return [m.rstrip("\"',)]}") for m in IMAGE_URL_PATTERN.findall(text)]
-    if isinstance(value, list):
-        return [u for item in value for u in extract_image_urls(item, depth + 1)]
-    if isinstance(value, dict):
-        preferred = ("resultUrls", "result_urls", "images", "urls", "image_urls",
-                     "output", "output_url", "image_url", "url", "result", "data")
-        urls: list[str] = []
-        for key in preferred:
-            urls.extend(extract_image_urls(value.get(key), depth + 1))
-        if not urls:  # fall back to scanning every value
-            for item in value.values():
-                urls.extend(extract_image_urls(item, depth + 1))
-        return urls
-    return []
+def extract_result_urls(data: dict) -> list[str]:
+    """
+    Pull generated image URL(s) from a record-info `data` object.
+
+    The documented shape is data.response.resultImageUrl. `originImageUrl` is
+    deliberately ignored (it expires after 10 minutes and duplicates the result).
+    """
+    response = data.get("response") or {}
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except ValueError:
+            response = {}
+
+    urls: list[str] = []
+    for key in ("resultImageUrl", "resultImageUrls", "resultUrls"):
+        value = response.get(key) if isinstance(response, dict) else None
+        if isinstance(value, str) and value.startswith("http"):
+            urls.append(value)
+        elif isinstance(value, list):
+            urls.extend(v for v in value if isinstance(v, str) and v.startswith("http"))
+    if not urls and isinstance(response, dict):
+        fallback = response.get("originImageUrl")
+        if isinstance(fallback, str) and fallback.startswith("http"):
+            urls.append(fallback)
+    return list(dict.fromkeys(urls))  # de-dupe, keep order
 
 
 def save_result(session: requests.Session, url: str, out_path: Path, args: argparse.Namespace) -> None:
@@ -315,12 +337,13 @@ def process_batch(args: argparse.Namespace) -> int:
     input_dir: Path = args.input
     output_dir: Path = args.output
     if not input_dir.is_dir():
-        input_dir.mkdir(parents=True, exist_ok=True)
-        log.error("Input folder '%s' was missing. Created it — add images and re-run.", input_dir)
+        log.error("Input folder '%s' does not exist.", input_dir)
         return 1
     output_dir.mkdir(parents=True, exist_ok=True)
 
     images = list(iter_input_images(input_dir))
+    if args.limit is not None and args.limit > 0:
+        images = images[:args.limit]
     if not images:
         log.warning("No supported images found in '%s'.", input_dir)
         return 0
@@ -336,7 +359,7 @@ def process_batch(args: argparse.Namespace) -> int:
 
     index = next_output_index(output_dir)
     succeeded = failed = 0
-    log.info("Found %d image(s). Model: %s | Endpoint: %s", len(images), args.model, API_BASE)
+    log.info("Processing %d image(s) via %s", len(images), GENERATE_URL)
 
     for n, path in enumerate(images, start=1):
         log.info("[%d/%d] Processing %s", n, len(images), path.name)
@@ -349,20 +372,20 @@ def process_batch(args: argparse.Namespace) -> int:
 
         try:
             image_url = upload_image(public, data, path.name, args)
-            log.debug("  Reference image URL: %s", image_url)
+            log.info("  Uploaded reference image: %s", image_url)
 
-            task_id = submit_edit_task(api, image_url, args)
+            task_id = submit_task(api, image_url, args)
             log.info("  Submitted task %s — polling...", task_id)
 
-            response = poll_task(api, task_id, args)
-            urls = list(dict.fromkeys(extract_image_urls(response)))  # de-dupe, keep order
+            record = poll_task(api, task_id, args)
+            urls = extract_result_urls(record)
             if not urls:
-                raise TaskFailed(f"Task succeeded but no image URL found: {str(response)[:200]}")
+                raise TaskFailed(f"Task succeeded but no result URL found: {json.dumps(record)[:300]}")
 
             for url in urls:
                 out_path = output_dir / f"{OUTPUT_PREFIX}{index:04d}.png"
                 save_result(public, url, out_path, args)
-                log.info("  Saved %s", out_path.name)
+                log.info("  Saved %s (%d bytes)", out_path.name, out_path.stat().st_size)
                 index += 1
             succeeded += 1
         except FatalAPIError as exc:
@@ -386,18 +409,20 @@ def process_batch(args: argparse.Namespace) -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Batch-convert photos into stylized AI avatars using the Nano Banana API.",
+        description="Batch-convert photos into stylized AI avatars using the NanoBanana API.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("-i", "--input", type=Path, default=Path(os.getenv("INPUT_DIR", "input_images")),
                         help="Folder containing source images.")
     parser.add_argument("-o", "--output", type=Path, default=Path(os.getenv("OUTPUT_DIR", "output_avatars")),
                         help="Folder where avatars are saved.")
-    parser.add_argument("--model", default=os.getenv("NANO_BANANA_MODEL", DEFAULT_MODEL),
-                        choices=["nano", "nano2", "nano2pro"])
     parser.add_argument("--prompt", default=os.getenv("STYLE_PROMPT", STYLE_PROMPT))
-    parser.add_argument("--aspect-ratio", default=os.getenv("ASPECT_RATIO", "1:1"))
-    parser.add_argument("--resolution", default=os.getenv("RESOLUTION", "1K"), choices=["1K", "2K", "4K"])
+    parser.add_argument("--image-size", default=os.getenv("IMAGE_SIZE", "1:1"), choices=ASPECT_RATIOS,
+                        help="Output aspect ratio.")
+    parser.add_argument("--num-images", type=int, default=env_int("NUM_IMAGES", 1), choices=range(1, 5),
+                        metavar="{1-4}", help="Images to generate per input photo.")
+    parser.add_argument("--callback-url", default=os.getenv("CALLBACK_URL", DEFAULT_CALLBACK_URL),
+                        help="Required by the API; unused because this script polls.")
     parser.add_argument("--max-side", type=int, default=env_int("MAX_IMAGE_SIDE", 1536),
                         help="Downscale inputs so the longest side is at most this many pixels.")
     parser.add_argument("--public-base-url", default=os.getenv("PUBLIC_IMAGE_BASE_URL", ""),
@@ -415,6 +440,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Base delay (seconds) for exponential backoff.")
     parser.add_argument("--delay", type=float, default=env_float("REQUEST_DELAY", 1.0),
                         help="Pause (seconds) between images to avoid rate limits.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit processing to the first N images.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging.")
     return parser.parse_args(argv)
 
@@ -426,6 +453,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Keep -v output focused on the pipeline, not Pillow's EXIF tag dump.
+    logging.getLogger("PIL").setLevel(logging.INFO)
     return process_batch(args)
 
 

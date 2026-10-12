@@ -9,6 +9,7 @@ __pycache__/
 input_images/
 output_avatars/
 headshots to convert/
+headshots_to_convert/
 
 # Virtual environments
 venv/
